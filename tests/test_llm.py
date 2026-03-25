@@ -57,7 +57,7 @@ def test_stream_response_emits_sentence_chunks_and_completion():
     ]
     fake_tts = FakeTTS()
     event_queue = queue.Queue()
-    config = SimpleNamespace(model="gpt-4o", temperature=0.8, max_tokens=500)
+    config = SimpleNamespace(model="gpt-4o-mini", temperature=0.8, max_tokens=500)
 
     with patch("voice_app.llm.OpenAI") as mock_openai:
         mock_openai.return_value.chat.completions.create.return_value = fake_stream
@@ -85,7 +85,7 @@ def test_cancel_invalidates_generation_and_drains_pending_submissions():
     with patch("voice_app.llm.OpenAI"):
         client = LLMClient(
             api_key="test",
-            config=SimpleNamespace(model="gpt-4o", temperature=0.8, max_tokens=500),
+            config=SimpleNamespace(model="gpt-4o-mini", temperature=0.8, max_tokens=500),
             event_queue=queue.Queue(),
             tts_engine=FakeTTS(),
         )

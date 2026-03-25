@@ -1,0 +1,11 @@
+# Conda env: conda env create -f environment.yml && conda activate cli-voice-agent
+name: cli-voice-agent
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.11,<3.13
+  - pip
+  # Helps PyAudio install reliably (especially on macOS)
+  - portaudio
+  - pip:
+      - -r requirements.txt

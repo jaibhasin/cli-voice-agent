@@ -26,7 +26,7 @@ def test_load_config_reads_yaml_and_env(tmp_path):
               utterance_end_ms: 1000
               smart_format: true
             llm:
-              model: "gpt-4o"
+              model: "gpt-4o-mini"
               temperature: 0.8
               max_tokens: 500
             tts:
@@ -56,7 +56,7 @@ def test_load_config_reads_yaml_and_env(tmp_path):
     assert cfg.audio.sample_rate == 16000
     assert cfg.vad.aggressiveness == 2
     assert cfg.deepgram.model == "nova-2"
-    assert cfg.llm.model == "gpt-4o"
+    assert cfg.llm.model == "gpt-4o-mini"
     assert cfg.tts.rate == 175
     assert cfg.history.file == "conv.json"
 
@@ -69,7 +69,7 @@ def test_load_config_raises_if_api_key_missing(tmp_path):
         "vad:\n  aggressiveness: 2\n  speech_start_frames: 6\n  ring_buffer_size: 8\n"
         "deepgram:\n  model: nova-2\n  language: en\n  endpointing: 300\n"
         "  utterance_end_ms: 1000\n  smart_format: true\n"
-        "llm:\n  model: gpt-4o\n  temperature: 0.8\n  max_tokens: 500\n"
+        "llm:\n  model: gpt-4o-mini\n  temperature: 0.8\n  max_tokens: 500\n"
         "tts:\n  rate: 175\n  volume: 0.9\n"
         "history:\n  file: x.json\n  max_messages_in_context: 50\n",
         encoding="utf-8",

@@ -9,6 +9,15 @@ from deepgram.core.events import EventType
 logger = logging.getLogger(__name__)
 
 
+def _blocking_queue_get(audio_queue: queue.Queue, timeout: float):
+    """Used with asyncio.to_thread so the event loop is not blocked."""
+
+    try:
+        return audio_queue.get(timeout=timeout)
+    except queue.Empty:
+        return None
+
+
 class STTClient:
     """Stream microphone audio to Deepgram and emit transcript events."""
 
@@ -31,6 +40,17 @@ class STTClient:
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._final_segments: list[str] = []
+        # When set, send silence to Deepgram and ignore transcripts (prevents speaker bleed → STT).
+        self._suppress_echo = threading.Event()
+
+    def set_echo_suppression(self, active: bool) -> None:
+        """Half-duplex guard: stop feeding mic audio to STT while assistant audio plays."""
+
+        if active:
+            self._suppress_echo.set()
+        else:
+            self._suppress_echo.clear()
 
     def start(self) -> None:
         """Launch the STT worker thread."""
@@ -60,11 +80,15 @@ class STTClient:
 
         dg = AsyncDeepgramClient(api_key=self.api_key)
 
+        self._final_segments.clear()
+
         try:
             async with dg.listen.v1.connect(
                 model=self.config.model,
                 language=self.config.language,
                 smart_format=str(self.config.smart_format).lower(),
+                # Deepgram requires interim_results when using utterance_end_ms (otherwise HTTP 400).
+                interim_results="true",
                 endpointing=str(self.config.endpointing),
                 utterance_end_ms=str(self.config.utterance_end_ms),
                 channels=str(self.channels),
@@ -73,22 +97,41 @@ class STTClient:
             ) as connection:
 
                 async def on_message(message) -> None:
+                    # UtteranceEnd has no transcript; must be handled before transcript extraction.
+                    msg_type = getattr(message, "type", None)
+                    if msg_type == "UtteranceEnd":
+                        if getattr(message, "last_word_end", 0.0) == -1:
+                            logger.debug("STT: UtteranceEnd ignored (last_word_end=-1)")
+                            return
+                        if self._suppress_echo.is_set():
+                            self._final_segments.clear()
+                            return
+                        text = self._flush_pending_utterance()
+                        if text:
+                            self.event_queue.put({"type": "UTTERANCE_COMPLETE", "text": text})
+                        return
+
+                    if self._suppress_echo.is_set():
+                        return
+
                     transcript = self._extract_transcript(message)
                     if not transcript:
                         return
 
-                    if getattr(message, "is_final", False):
-                        event_type = (
-                            "UTTERANCE_COMPLETE"
-                            if getattr(message, "speech_final", False)
-                            else "TRANSCRIPT_INTERIM"
-                        )
+                    if not getattr(message, "is_final", False):
+                        logger.debug("STT interim: %s", transcript)
                         self.event_queue.put(
-                            {
-                                "type": event_type,
-                                "text": transcript,
-                            }
+                            {"type": "TRANSCRIPT_INTERIM", "text": transcript}
                         )
+                        return
+
+                    self._merge_final_segment(transcript)
+                    logger.debug("STT final segment: %s", transcript)
+
+                    if getattr(message, "speech_final", False):
+                        text = self._flush_pending_utterance()
+                        if text:
+                            self.event_queue.put({"type": "UTTERANCE_COMPLETE", "text": text})
 
                 async def on_error(error) -> None:
                     logger.error("Deepgram error: %s", error)
@@ -97,13 +140,18 @@ class STTClient:
                 connection.on(EventType.MESSAGE, on_message)
                 connection.on(EventType.ERROR, on_error)
                 listener_task = asyncio.create_task(connection.start_listening())
+                # Allow start_listening() to emit OPEN and begin recv (do not block the loop on queue.get).
+                await asyncio.sleep(0)
 
                 while not self._stop_event.is_set():
-                    try:
-                        frame = self.audio_queue.get(timeout=0.1)
-                    except queue.Empty:
-                        await asyncio.sleep(0)
+                    frame = await asyncio.to_thread(
+                        _blocking_queue_get, self.audio_queue, 0.1
+                    )
+                    if frame is None:
                         continue
+
+                    if self._suppress_echo.is_set():
+                        frame = b"\x00" * len(frame)
 
                     try:
                         await connection.send_media(frame)
@@ -122,6 +170,23 @@ class STTClient:
         except Exception as exc:
             logger.error("Deepgram connection error: %s", exc)
             self.event_queue.put({"type": "ERROR", "error": str(exc)})
+
+    def _merge_final_segment(self, transcript: str) -> None:
+        """Merge a locked-in final segment, replacing the last segment when Deepgram refines it."""
+
+        if not self._final_segments:
+            self._final_segments.append(transcript)
+            return
+        last = self._final_segments[-1]
+        if transcript.startswith(last) or last.startswith(transcript):
+            self._final_segments[-1] = transcript
+        else:
+            self._final_segments.append(transcript)
+
+    def _flush_pending_utterance(self) -> str:
+        text = " ".join(self._final_segments).strip()
+        self._final_segments.clear()
+        return text
 
     @staticmethod
     def _extract_transcript(message) -> str:

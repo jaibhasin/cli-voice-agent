@@ -15,6 +15,10 @@ vad:
   aggressiveness: 2
   speech_start_frames: 6
   ring_buffer_size: 8
+  # If false (default), speaker output won't trigger a false "interrupt", and the
+  # mic is not sent to STT during TTS (half-duplex, no echo transcripts). If true,
+  # use headphones: barge-in + full mic/STT during playback.
+  barge_in_while_speaking: false
 
 # Deepgram live transcription settings
 deepgram:
@@ -26,14 +30,16 @@ deepgram:
 
 # OpenAI LLM settings
 llm:
-  model: "gpt-4o"
+  model: "gpt-4o-mini"
   temperature: 0.8
   max_tokens: 500
 
-# Text-to-speech settings (macOS NSSpeechSynthesizer via pyttsx3)
+# Text-to-speech (macOS: built-in `say`; Linux: pyttsx3)
 tts:
   rate: 175
   volume: 0.9
+  # Keep sending silence to STT this long after speech ends (reduces room echo).
+  echo_suppress_tail_ms: 350
 
 # Conversation persistence
 history:

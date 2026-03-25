@@ -21,6 +21,9 @@ class VADConfig:
     aggressiveness: int = 2
     speech_start_frames: int = 6
     ring_buffer_size: int = 8
+    # If True, mic speech can interrupt TTS (barge-in). False avoids speaker bleed
+    # triggering false interrupts; use headphones if True.
+    barge_in_while_speaking: bool = False
 
 
 @dataclass
@@ -38,7 +41,7 @@ class DeepgramConfig:
 class LLMConfig:
     """OpenAI response generation settings."""
 
-    model: str = "gpt-4o"
+    model: str = "gpt-4o-mini"
     temperature: float = 0.8
     max_tokens: int = 500
 
@@ -49,6 +52,8 @@ class TTSConfig:
 
     rate: int = 175
     volume: float = 0.9
+    # After TTS ends, keep mic audio from reaching STT this many ms longer (room echo).
+    echo_suppress_tail_ms: int = 350
 
 
 @dataclass

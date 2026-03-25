@@ -28,7 +28,8 @@ class Orchestrator:
         self._pending_response_by_gen: dict[int, str] = {}
 
         self._vad_audio_queue: queue.Queue = queue.Queue(maxsize=200)
-        self._stt_audio_queue: queue.Queue = queue.Queue(maxsize=200)
+        # Larger buffer for STT so brief backpressure does not drop audio before Deepgram.
+        self._stt_audio_queue: queue.Queue = queue.Queue(maxsize=2000)
 
         self.audio_capture = AudioCapture(
             sample_rate=config.audio.sample_rate,
@@ -63,8 +64,32 @@ class Orchestrator:
             sample_rate=config.audio.sample_rate,
             channels=config.audio.channels,
         )
+        self._echo_suppress_timer: threading.Timer | None = None
 
         self._messages = load_history(config.history.file)
+
+    def _cancel_echo_suppress_timer(self) -> None:
+        if self._echo_suppress_timer is not None:
+            self._echo_suppress_timer.cancel()
+            self._echo_suppress_timer = None
+
+    def _set_stt_echo_suppression(self, active: bool) -> None:
+        self.stt.set_echo_suppression(active)
+
+    def _schedule_stt_echo_release(self) -> None:
+        """Re-open mic to Deepgram after TTS plus a short tail (room echo)."""
+
+        self._cancel_echo_suppress_timer()
+        delay_s = max(0.0, self.config.tts.echo_suppress_tail_ms / 1000.0)
+
+        def _release() -> None:
+            self._set_stt_echo_suppression(False)
+            self._echo_suppress_timer = None
+
+        timer = threading.Timer(delay_s, _release)
+        timer.daemon = True
+        self._echo_suppress_timer = timer
+        timer.start()
 
     def run(self) -> None:
         """Start worker threads and block in the main event loop."""
@@ -104,7 +129,15 @@ class Orchestrator:
 
             if current_state == State.IDLE and speech_detected:
                 self.event_queue.put({"type": "SPEECH_DETECTED"})
-            elif current_state in (State.SPEAKING, State.PROCESSING) and speech_detected:
+            elif current_state == State.PROCESSING and speech_detected:
+                # User can cancel before TTS starts (no speaker echo yet).
+                self.event_queue.put({"type": "INTERRUPT"})
+            elif (
+                current_state == State.SPEAKING
+                and speech_detected
+                and self.config.vad.barge_in_while_speaking
+            ):
+                # Optional barge-in during playback (needs headphones without echo).
                 self.event_queue.put({"type": "INTERRUPT"})
 
     def _event_loop(self) -> None:
@@ -124,13 +157,24 @@ class Orchestrator:
                 self._display_status("Listening...")
 
             elif event_type == "UTTERANCE_COMPLETE":
+                if self.state_machine.state != State.LISTENING:
+                    logger.debug(
+                        "Ignoring UTTERANCE_COMPLETE (state=%s)",
+                        self.state_machine.state,
+                    )
+                    continue
                 text = event["text"]
                 self.state_machine.transition(AppEvent.UTTERANCE_COMPLETE)
                 self._display_user(text)
                 self._handle_utterance(text)
 
             elif event_type == "FIRST_TTS_CHUNK":
+                # Half-duplex STT: mute mic to Deepgram while TTS plays (unless barge-in + headphones).
+                if not self.config.vad.barge_in_while_speaking:
+                    self._cancel_echo_suppress_timer()
+                    self._set_stt_echo_suppression(True)
                 self.state_machine.transition(AppEvent.FIRST_TTS_CHUNK)
+                self.vad.reset()
                 self._display_status("Speaking...")
 
             elif event_type == "LLM_RESPONSE_READY":
@@ -148,6 +192,9 @@ class Orchestrator:
                             response_text,
                             self.config.history.max_messages_in_context,
                         )
+                    self.vad.reset()
+                    if not self.config.vad.barge_in_while_speaking:
+                        self._schedule_stt_echo_release()
                     self._display_status("Ready")
 
             elif event_type == "INTERRUPT":
@@ -158,16 +205,20 @@ class Orchestrator:
                     self.tts.interrupt()
                     self.llm.cancel()
                     self.vad.reset()
+                    self._cancel_echo_suppress_timer()
+                    self._set_stt_echo_suppression(False)
                     self.state_machine.transition(AppEvent.INTERRUPT)
                     self._display_status("Interrupted — listening...")
 
             elif event_type == "TRANSCRIPT_INTERIM":
                 if self.debug:
-                    print(f"  [{event['text']}]", end="\r", flush=True)
+                    logger.debug("[STT partial] %s", event.get("text", ""))
 
             elif event_type == "ERROR":
                 logger.error("Error event: %s", event.get("error"))
                 print(f"  Error: {event.get('error')}")
+                self._cancel_echo_suppress_timer()
+                self._set_stt_echo_suppression(False)
                 self.state_machine.transition(AppEvent.ERROR)
                 self._display_status("Ready (after error)")
 
@@ -195,11 +246,13 @@ class Orchestrator:
         print(f"  [{status}]")
 
     def _display_user(self, text: str) -> None:
-        print(f"\nYou: {text}")
+        print(f"\n[STT] {text}")
 
     def _shutdown(self) -> None:
         """Stop all workers in reverse start order and exit cleanly."""
 
+        self._cancel_echo_suppress_timer()
+        self._set_stt_echo_suppression(False)
         self._shutdown_event.set()
         if self._vad_thread is not None:
             self._vad_thread.join(timeout=1)

@@ -8,7 +8,7 @@ from voice_app.orchestrator import Orchestrator
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Voice LLM — Full Duplex with VAD. Talk to GPT-4o like a phone call."
+        description="Voice LLM — Full Duplex with VAD. Talk to GPT-4o mini like a phone call."
     )
     parser.add_argument(
         "--new",
@@ -28,9 +28,13 @@ def main() -> None:
     args = parser.parse_args()
 
     logging.basicConfig(
-        level=logging.DEBUG if args.debug else logging.WARNING,
+        level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
+    # Keep third-party libraries quieter unless --debug.
+    if not args.debug:
+        for noisy in ("httpx", "httpcore", "openai", "websockets"):
+            logging.getLogger(noisy).setLevel(logging.WARNING)
 
     config = load_config(args.config)
 
