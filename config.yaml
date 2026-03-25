@@ -1,0 +1,41 @@
+# Personality — the AI's voice and style
+system_prompt: |
+  You are a friendly, casual companion. You speak naturally like a close
+  friend would. Keep responses concise (2-3 sentences) since this is a
+  voice conversation. Be warm, use casual language, avoid being formal.
+
+# Raw audio capture settings
+audio:
+  sample_rate: 16000
+  frame_duration_ms: 20
+  channels: 1
+
+# Voice Activity Detection — tunes interrupt sensitivity
+vad:
+  aggressiveness: 2
+  speech_start_frames: 6
+  ring_buffer_size: 8
+
+# Deepgram live transcription settings
+deepgram:
+  model: "nova-2"
+  language: "en"
+  endpointing: 300
+  utterance_end_ms: 1000
+  smart_format: true
+
+# OpenAI LLM settings
+llm:
+  model: "gpt-4o"
+  temperature: 0.8
+  max_tokens: 500
+
+# Text-to-speech settings (macOS NSSpeechSynthesizer via pyttsx3)
+tts:
+  rate: 175
+  volume: 0.9
+
+# Conversation persistence
+history:
+  file: "conversation_history.json"
+  max_messages_in_context: 50

@@ -21,7 +21,7 @@
 ## Project Structure
 
 ```
-minnetonka/
+cli-voice-agent/
 ├── main.py                      # Entry point — args, bootstrap, run
 ├── requirements.txt             # All Python dependencies
 ├── config.yaml                  # Tunable settings (VAD thresholds, TTS rate, etc.)
