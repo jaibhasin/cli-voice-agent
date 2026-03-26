@@ -7,5 +7,8 @@ dependencies:
   - pip
   # Helps PyAudio install reliably (especially on macOS)
   - portaudio
+  # Native libspeexdsp required by the speexdsp Python AEC bindings.
+  # Python package is installed via pip (see requirements.txt).
+  - speexdsp
   - pip:
       - -r requirements.txt
