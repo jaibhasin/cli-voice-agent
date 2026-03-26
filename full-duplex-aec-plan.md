@@ -1,4 +1,4 @@
-# Plan: True Full-Duplex via Software AEC (speexdsp + PyAudio TTS)
+# Plan: True Full-Duplex via Software AEC (speexdsp + Deepgram WS TTS + PyAudio)
 
 ## Context
 
@@ -10,7 +10,7 @@ The goal is true full-duplex — agent speaks through speakers **and** listens a
 
 ---
 
-## Approach: PyAudio TTS Output + speexdsp AEC
+## Approach: PyAudio TTS Output + speexdsp AEC + Deepgram TTS WebSocket
 
 ### High-Level Data Flow (after change)
 
@@ -38,12 +38,12 @@ When `aec.enabled`, echo suppression in `orchestrator.py` and `stt.py` is **remo
 | File | Change |
 |------|--------|
 | `voice_app/aec.py` | **NEW** — `SpeakerReferenceBuffer` + `AECProcessor` |
-| `voice_app/tts.py` | Replace `say` subprocess + pyttsx3 with PyAudio output stream + Deepgram TTS PCM |
+| `voice_app/tts.py` | Replace `say` subprocess + pyttsx3 with a persistent Deepgram TTS WebSocket + PyAudio output stream + PCM reference tap |
 | `voice_app/audio_capture.py` | Inject optional `aec_processor` — apply AEC to frames before queuing |
 | `voice_app/config.py` | Add `AECConfig` dataclass; extend `AppConfig` and `TTSConfig` |
 | `voice_app/orchestrator.py` | When `aec.enabled`, remove echo-suppression timers and wire `AECProcessor` → `AudioCapture`; when disabled, keep current behavior |
 | `voice_app/stt.py` | When `aec.enabled`, drop echo suppression; when disabled, keep `set_echo_suppression` / silence path |
-| `config.yaml` | Add `aec:` section; add TTS `service`/`voice` fields |
+| `config.yaml` | Add `aec:` section; add TTS `service`/`voice` fields; bump default STT model from `nova-2` to `nova-3` |
 | `requirements.txt` | Add `speexdsp` (PyPI package builds against system **libspeexdsp**; needs compiler + often `brew install speexdsp` on macOS / `libspeexdsp-dev` on Debian) |
 | `environment.yml` | Add `speexdsp` (conda-forge) for the native lib; Python bindings may still be installed via pip |
 | `tests/test_aec.py` | **NEW** — unit tests for buffer and AEC processor |
@@ -66,10 +66,16 @@ When `aec.enabled`, echo suppression in `orchestrator.py` and `stt.py` is **remo
       speaker_delay_ms: int = 0   # 0 = let speexdsp adapt
       ref_buffer_frames: int = 200  # 4s of reference at 20ms/frame
   ```
-- Extend `TTSConfig` with `service: str = "deepgram"`, `voice: str = "aura-asteria-en"`
+- Extend `TTSConfig` with `service: str = "deepgram"`, `voice: str = "aura-2-thalia-en"`
 - Add `aec: AECConfig` to `AppConfig`; parse `raw.get("aec", {})` in `load_config`
+- Refresh the STT baseline in `config.yaml`: set `deepgram.model: "nova-3"` by default. Keep the current `endpointing` / `utterance_end_ms` path in this plan. Do **not** switch to Flux inside the AEC rollout, because Flux changes the turn-detection contract and would confound the migration.
 - Update `config.yaml`:
   ```yaml
+  deepgram:
+    model: "nova-3"
+    language: "en"
+    endpointing: 300
+    utterance_end_ms: 1000
   aec:
     enabled: true
     filter_length: 2048
@@ -77,7 +83,7 @@ When `aec.enabled`, echo suppression in `orchestrator.py` and `stt.py` is **remo
     ref_buffer_frames: 200
   tts:
     service: "deepgram"
-    voice: "aura-asteria-en"
+    voice: "aura-2-thalia-en"
     rate: 175
     volume: 0.9
     echo_suppress_tail_ms: 350   # kept for aec.enabled=false fallback
@@ -101,12 +107,14 @@ When `aec.enabled`, echo suppression in `orchestrator.py` and `stt.py` is **remo
 - Write `tests/test_aec.py`
 
 ### Step 3 — Rewrite `voice_app/tts.py`
-- Replace `_speak_macos_say()` / pyttsx3 paths with:
-  - `_fetch_pcm_deepgram(text, gen_id) -> bytes | None` — HTTP POST to Deepgram `/v1/speak` with `encoding=linear16&sample_rate=16000&container=none`; returns raw PCM; returns `None` if gen_id stale
-  - `_pyaudio_callback(in_data, frame_count, time_info, status)` — pops one **320-sample** `linear16` frame (**640 bytes**) from `_playback_queue`; records `(monotonic_ns(), frame)` to `_ref_buffer` (if AEC enabled); returns `(frame, paContinue)`
-  - `_run_pyaudio()` — main TTS worker loop: dequeues `(text, gen_id)`, fetches PCM (streaming the HTTP body is fine), slices into **640-byte** (`320-sample`) frames, enqueues to `_playback_queue`, waits for drain, emits `TTS_COMPLETE`
+- Replace `_speak_macos_say()` / pyttsx3 paths with a single persistent Deepgram TTS WebSocket + PyAudio output pipeline:
+  - `_open_tts_ws()` — open one `deepgram.speak.v1.connect(...)` websocket per conversation with `model=config.tts.voice`, `encoding="linear16"`, `sample_rate=16000`; keep voice/media settings fixed for the session
+  - `_tts_ws_on_message(message)` — when `message` is `bytes`, slice it into **640-byte** (`320-sample`) frames and enqueue into a **bounded** `_playback_queue`; when it is metadata / control output, log or ignore
+  - `_pyaudio_callback(in_data, frame_count, time_info, status)` — pops one **320-sample** `linear16` frame (**640 bytes**) from `_playback_queue`; records `(monotonic_ns(), frame)` to `_ref_buffer` (if AEC enabled); returns `(frame, paContinue)`; on underrun, returns silence
+  - `_run_tts_ws()` — main TTS worker loop: maintain the websocket and its listener, dequeue `(text, gen_id)` sentence chunks, `send_text(...)` each chunk immediately, and send `Flush` only when an assistant turn is complete (`finish(gen_id)`) or a hard boundary must be forced
+- Keep the existing sentence chunking in `voice_app/llm.py`; do **not** flush on every token. Deepgram documents a `Flush` limit of **20 per 60 seconds**, and very frequent flushes can degrade quality.
 - **Preserve all existing public API**: `speak()`, `finish()`, `interrupt()`, `set_generation()`, `start()`, `stop()`
-- `interrupt()` additionally clears `_playback_queue` and drains `_ref_buffer`
+- `interrupt()` additionally clears `_playback_queue`, drains `_ref_buffer`, and sends `Clear` on the TTS websocket; if the connection is ambiguous or stale audio keeps arriving, close and recreate the websocket before the next turn
 - `TTSEngine.__init__` accepts optional `ref_buffer: SpeakerReferenceBuffer | None`
 - Update `tests/test_tts.py`; update `tests/conftest.py` (replace pyttsx3 fixture with PyAudio mock)
 
@@ -131,6 +139,7 @@ When `aec.enabled`, echo suppression in `orchestrator.py` and `stt.py` is **remo
 
 ### Step 6 — Echo suppression in `voice_app/stt.py`
 - Plumb `aec_enabled` from config into `STTClient` (or pass `AppConfig`) so one codebase can branch at init
+- Keep Deepgram STT on the existing WebSocket path, but make `nova-3` the default model in config for this migration. Evaluate Flux only after AEC stabilizes, because Flux replaces the current endpointing/utterance-end behavior with model-integrated turn detection.
 - **If `config.aec.enabled`**: Remove `_suppress_echo`, `set_echo_suppression()`, and silence injection / transcript drops tied to it — `STTClient` is a pure passthrough (orchestrator no longer toggles suppression on this path)
 - **If AEC disabled**: **keep** the existing half-duplex guard (same as today); orchestrator continues to drive `set_echo_suppression` as in current `orchestrator.py`
 
@@ -147,8 +156,8 @@ speexdsp is adaptive — it learns the room's acoustic delay within ~1 second of
 | Risk | Mitigation |
 |------|-----------|
 | `speexdsp` macOS install requires `brew install speexdsp` | `aec.enabled: false` by default — import only attempted when enabled; clear error message on failure |
-| Deepgram TTS REST can show **~600ms+ TTFB** and **~700ms+** end-to-end in their docs' examples ([Text-to-speech latency](https://developers.deepgram.com/docs/text-to-speech-latency)) | Use **HTTP `stream=True`** and feed playback from the **first response bytes** ([Streaming the audio output](https://developers.deepgram.com/docs/streaming-the-audio-output)); optionally pipeline sentence N+1 while N plays ([Text chunking for TTS](https://developers.deepgram.com/docs/text-chunking-for-tts-optimization)) |
-| PyAudio output callback is real-time — must not block | `_playback_queue.get_nowait()` with silence fallback; no locks in callback hot path |
+| Deepgram TTS WebSocket requires correct `Flush` / `Clear` / `Close` handling, and `Flush` is limited to **20 per 60s** | Keep sentence-sized text chunking, send `Flush` only at assistant-turn end (or deliberate hard boundaries), use `Clear` on interrupt, and recreate the socket on protocol ambiguity |
+| PyAudio output callback is real-time — must not block | `_playback_queue.get_nowait()` with silence fallback in the callback; keep `_playback_queue` **bounded** so the websocket receiver can block and apply normal TCP backpressure instead of growing memory unbounded |
 | AEC convergence takes ~1s of audio | Acceptable for real conversations; AEC degrades gracefully to partial suppression during warmup |
 
 ---
@@ -165,8 +174,13 @@ speexdsp is adaptive — it learns the room's acoustic delay within ~1 second of
 ## Sources Consulted
 
 - [Deepgram Voice Agent Echo Cancellation](https://developers.deepgram.com/docs/voice-agent-echo-cancellation)
-- [OpenAI Realtime API VAD](https://platform.openai.com/docs/guides/realtime-vad)
+- [Deepgram Text-to-Speech Streaming](https://developers.deepgram.com/docs/tts-websocket)
+- [Deepgram Streaming Text-to-Speech Getting Started](https://developers.deepgram.com/docs/streaming-text-to-speech)
+- [Deepgram Flush Control Message](https://developers.deepgram.com/docs/tts-ws-flush)
+- [Deepgram Clear Control Message](https://developers.deepgram.com/docs/tts-ws-clear)
+- [Deepgram Compare Flux to Nova-3](https://developers.deepgram.com/docs/flux/flux-nova-3-comparison)
 - [speexdsp-python GitHub](https://github.com/xiongyihui/speexdsp-python)
-- [Deepgram — Streaming the audio output](https://developers.deepgram.com/docs/streaming-the-audio-output)
-- [Optimizing Voice Agent Barge-in Detection 2025](https://sparkco.ai/blog/optimizing-voice-agent-barge-in-detection-for-2025)
-- [Real-Time vs Turn-Based Voice Agent Architecture](https://softcery.com/lab/ai-voice-agents-real-time-vs-turn-based-tts-stt-architecture)
+- [Deepgram Real-Time TTS with WebSockets](https://developers.deepgram.com/docs/tts-websocket-streaming)
+- [Deepgram Text Chunking for TTS](https://developers.deepgram.com/docs/tts-text-chunking)
+- [OpenAI Realtime API Reference](https://developers.openai.com/api/reference/resources/realtime)
+- [websockets Buffer Limits](https://websockets.readthedocs.io/en/stable/reference/legacy/common.html)
