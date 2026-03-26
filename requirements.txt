@@ -2,7 +2,10 @@ openai>=1.30.0
 deepgram-sdk>=6,<7
 pyaudio>=0.2.14
 webrtcvad>=2.0.10
-pyttsx3>=2.90
+# speexdsp provides Python bindings for libspeexdsp (AEC).
+# System lib required: brew install speexdsp (macOS) / apt install libspeexdsp-dev (Debian)
+# Only needed when aec.enabled = true; import is deferred to AECProcessor.__init__
+speexdsp
 pyyaml>=6.0
 python-dotenv>=1.0.0
 setuptools>=69.0.0,<81

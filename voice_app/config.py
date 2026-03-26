@@ -1,5 +1,5 @@
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import yaml
 from dotenv import load_dotenv
@@ -23,6 +23,8 @@ class VADConfig:
     ring_buffer_size: int = 8
     # If True, mic speech can interrupt TTS (barge-in). False avoids speaker bleed
     # triggering false interrupts; use headphones if True.
+    # When aec.enabled is True this flag is ignored — AEC removes the echo so
+    # barge-in works safely without headphones.
     barge_in_while_speaking: bool = False
 
 
@@ -30,7 +32,8 @@ class VADConfig:
 class DeepgramConfig:
     """Deepgram live transcription settings."""
 
-    model: str = "nova-2"
+    # nova-3 is the current Deepgram flagship STT model (better accuracy than nova-2).
+    model: str = "nova-3"
     language: str = "en"
     endpointing: int = 300
     utterance_end_ms: int = 1000
@@ -47,13 +50,49 @@ class LLMConfig:
 
 
 @dataclass
+class AECConfig:
+    """
+    Software Acoustic Echo Cancellation (speexdsp) settings.
+
+    When enabled = True:
+      • TTSEngine records every played PCM frame into SpeakerReferenceBuffer.
+      • AudioCapture runs each mic frame through AECProcessor (speexdsp) before
+        queuing it for VAD and STT — removing the speaker signal from the mic.
+      • The STT half-duplex silence-injection and echo-suppress timer are disabled.
+      • barge_in_while_speaking is ignored (always on when AEC is active).
+
+    When enabled = False (default):
+      • The half-duplex path (silence injection + echo_suppress_tail_ms timer)
+        is used exactly as before.  No AEC components are created.
+
+    filter_length:       speexdsp tail length in samples; 2048 = 128 ms at 16 kHz.
+    speaker_delay_ms:    Expected playback buffer delay; 0 = let speexdsp adapt.
+    ref_buffer_frames:   Depth of the speaker reference ring-buffer (200 ≈ 4 s).
+    """
+
+    enabled: bool = False
+    filter_length: int = 2048
+    speaker_delay_ms: int = 0
+    ref_buffer_frames: int = 200
+
+
+@dataclass
 class TTSConfig:
-    """Speech synthesis settings."""
+    """
+    Speech synthesis settings.
+
+    service / voice apply to the Deepgram TTS WebSocket path.
+    echo_suppress_tail_ms is only used when aec.enabled is False (half-duplex fallback).
+    """
 
     rate: int = 175
     volume: float = 0.9
     # After TTS ends, keep mic audio from reaching STT this many ms longer (room echo).
+    # Only relevant when aec.enabled = false.
     echo_suppress_tail_ms: int = 350
+    # Deepgram TTS WebSocket model.  See deepgram.com/docs for available voices.
+    service: str = "deepgram"
+    voice: str = "aura-2-thalia-en"
 
 
 @dataclass
@@ -77,6 +116,8 @@ class AppConfig:
     history: HistoryConfig
     openai_api_key: str
     deepgram_api_key: str
+    # aec must come last because it has a default (Python dataclass ordering rule).
+    aec: AECConfig = field(default_factory=AECConfig)
 
 
 def load_config(config_path: str = "config.yaml") -> AppConfig:
@@ -103,4 +144,5 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         history=HistoryConfig(**raw.get("history", {})),
         openai_api_key=os.environ["OPENAI_API_KEY"],
         deepgram_api_key=os.environ["DEEPGRAM_API_KEY"],
+        aec=AECConfig(**raw.get("aec", {})),
     )

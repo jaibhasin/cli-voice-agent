@@ -19,7 +19,23 @@ def _blocking_queue_get(audio_queue: queue.Queue, timeout: float):
 
 
 class STTClient:
-    """Stream microphone audio to Deepgram and emit transcript events."""
+    """
+    Stream microphone audio to Deepgram and emit transcript events.
+
+    AEC path (aec_enabled = True)
+    ==============================
+    The mic audio arriving in audio_queue has already been echo-cancelled by
+    AECProcessor.  STTClient becomes a pure passthrough — silence injection and
+    transcript suppression are disabled.  set_echo_suppression() is a no-op.
+
+    Half-duplex path (aec_enabled = False, default)
+    ================================================
+    When the orchestrator sets echo suppression active (during TTS playback):
+      • Mic frames are replaced with silence before being sent to Deepgram,
+        preventing speaker bleed from reaching the language model.
+      • Any transcripts or UtteranceEnd events received while suppressed are
+        discarded (Deepgram may still emit partial results from buffered audio).
+    """
 
     def __init__(
         self,
@@ -30,23 +46,38 @@ class STTClient:
         *,
         sample_rate: int = 16000,
         channels: int = 1,
+        aec_enabled: bool = False,
     ) -> None:
+        """
+        Parameters
+        ----------
+        aec_enabled: When True, skip all silence-injection and echo-suppress
+                     logic — AEC has already cleaned the mic frames upstream.
+        """
         self.api_key = api_key
         self.config = config
         self.audio_queue = audio_queue
         self.event_queue = event_queue
         self.sample_rate = sample_rate
         self.channels = channels
+        self._aec_enabled = aec_enabled
 
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._final_segments: list[str] = []
-        # When set, send silence to Deepgram and ignore transcripts (prevents speaker bleed → STT).
+        # Echo-suppress gate — always created; only toggled when _aec_enabled is False.
+        # Using a threading.Event (rather than a bool) avoids a lock in the async path.
         self._suppress_echo = threading.Event()
 
     def set_echo_suppression(self, active: bool) -> None:
-        """Half-duplex guard: stop feeding mic audio to STT while assistant audio plays."""
+        """
+        Half-duplex guard: mute mic audio to Deepgram while the assistant speaks.
 
+        No-op when aec_enabled is True — the AEC removes the echo from the mic
+        signal upstream, so suppression is unnecessary and would mute real speech.
+        """
+        if self._aec_enabled:
+            return
         if active:
             self._suppress_echo.set()
         else:
@@ -103,7 +134,9 @@ class STTClient:
                         if getattr(message, "last_word_end", 0.0) == -1:
                             logger.debug("STT: UtteranceEnd ignored (last_word_end=-1)")
                             return
-                        if self._suppress_echo.is_set():
+                        # Half-duplex: discard utterance that arrived during TTS playback.
+                        # AEC path: always pass through — echo was removed upstream.
+                        if not self._aec_enabled and self._suppress_echo.is_set():
                             self._final_segments.clear()
                             return
                         text = self._flush_pending_utterance()
@@ -111,7 +144,9 @@ class STTClient:
                             self.event_queue.put({"type": "UTTERANCE_COMPLETE", "text": text})
                         return
 
-                    if self._suppress_echo.is_set():
+                    # Half-duplex: drop transcript messages received while suppressed.
+                    # AEC path: pass all messages through.
+                    if not self._aec_enabled and self._suppress_echo.is_set():
                         return
 
                     transcript = self._extract_transcript(message)
@@ -150,7 +185,9 @@ class STTClient:
                     if frame is None:
                         continue
 
-                    if self._suppress_echo.is_set():
+                    # Half-duplex: replace mic audio with silence during TTS playback.
+                    # AEC path: audio is already echo-free — send as-is.
+                    if not self._aec_enabled and self._suppress_echo.is_set():
                         frame = b"\x00" * len(frame)
 
                     try:

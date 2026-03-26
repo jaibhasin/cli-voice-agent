@@ -1,3 +1,27 @@
+"""
+voice_app/orchestrator.py — Coordinate all background workers and drive the
+conversation lifecycle via a central event queue + state machine.
+
+AEC vs half-duplex path
+=======================
+When config.aec.enabled is True:
+  • SpeakerReferenceBuffer and AECProcessor are created and wired into
+    TTSEngine (speaker reference tap) and AudioCapture (mic cleanup).
+  • STT receives echo-free audio → set_echo_suppression / silence injection
+    are disabled.
+  • The VAD loop emits INTERRUPT whenever speech is detected in SPEAKING state
+    (no barge_in_while_speaking gate — AEC prevents false positives from the
+    speaker signal reaching the mic).
+  • All _echo_suppress_timer / _set_stt_echo_suppression / _schedule_stt_echo_release
+    call sites are skipped.
+
+When config.aec.enabled is False (default):
+  • Original half-duplex behaviour is preserved exactly:
+    – FIRST_TTS_CHUNK mutes the STT mic path.
+    – TTS_COMPLETE schedules re-opening the mic path after echo_suppress_tail_ms.
+    – VAD INTERRUPT in SPEAKING state requires barge_in_while_speaking = True.
+"""
+
 import logging
 import queue
 import threading
@@ -31,9 +55,36 @@ class Orchestrator:
         # Larger buffer for STT so brief backpressure does not drop audio before Deepgram.
         self._stt_audio_queue: queue.Queue = queue.Queue(maxsize=2000)
 
+        # ------------------------------------------------------------------
+        # AEC setup — must happen before constructing TTSEngine / AudioCapture
+        # so that the shared SpeakerReferenceBuffer is available to both.
+        # ------------------------------------------------------------------
+        _ref_buffer = None    # SpeakerReferenceBuffer | None
+        _aec_processor = None  # AECProcessor | None
+
+        if config.aec.enabled:
+            # Local import so the module loads cleanly when speexdsp is absent
+            # and aec.enabled is False (the common case).
+            from voice_app.aec import AECProcessor, SpeakerReferenceBuffer
+
+            # 320 samples = one 20 ms frame at 16 kHz (matches FRAME_SIZE in aec.py)
+            _ref_buffer = SpeakerReferenceBuffer(
+                maxlen=config.aec.ref_buffer_frames, frame_size=320
+            )
+            _aec_processor = AECProcessor(
+                config=config.aec,
+                sample_rate=config.audio.sample_rate,
+                frame_size=320,
+                ref_buffer=_ref_buffer,
+            )
+
+        # ------------------------------------------------------------------
+        # Audio capture — with optional AEC processor
+        # ------------------------------------------------------------------
         self.audio_capture = AudioCapture(
             sample_rate=config.audio.sample_rate,
             channels=config.audio.channels,
+            aec_processor=_aec_processor,
         )
         self.audio_capture.add_consumer(self._vad_audio_queue)
         self.audio_capture.add_consumer(self._stt_audio_queue)
@@ -45,17 +96,28 @@ class Orchestrator:
             speech_start_frames=config.vad.speech_start_frames,
         )
 
+        # ------------------------------------------------------------------
+        # TTS — now uses Deepgram WS + PyAudio; receives ref_buffer for AEC
+        # ------------------------------------------------------------------
         self.tts = TTSEngine(
             rate=config.tts.rate,
             volume=config.tts.volume,
             event_queue=self.event_queue,
+            api_key=config.deepgram_api_key,
+            voice=config.tts.voice,
+            ref_buffer=_ref_buffer,
         )
+
         self.llm = LLMClient(
             api_key=config.openai_api_key,
             config=config.llm,
             event_queue=self.event_queue,
             tts_engine=self.tts,
         )
+
+        # ------------------------------------------------------------------
+        # STT — with aec_enabled flag; when True, silence injection is a no-op
+        # ------------------------------------------------------------------
         self.stt = STTClient(
             api_key=config.deepgram_api_key,
             config=config.deepgram,
@@ -63,10 +125,18 @@ class Orchestrator:
             event_queue=self.event_queue,
             sample_rate=config.audio.sample_rate,
             channels=config.audio.channels,
+            aec_enabled=config.aec.enabled,
         )
+
+        # Half-duplex echo-suppress timer (only used when aec.enabled is False)
         self._echo_suppress_timer: threading.Timer | None = None
 
         self._messages = load_history(config.history.file)
+
+    # -----------------------------------------------------------------------
+    # Half-duplex echo suppression helpers
+    # (only called when config.aec.enabled is False)
+    # -----------------------------------------------------------------------
 
     def _cancel_echo_suppress_timer(self) -> None:
         if self._echo_suppress_timer is not None:
@@ -78,7 +148,6 @@ class Orchestrator:
 
     def _schedule_stt_echo_release(self) -> None:
         """Re-open mic to Deepgram after TTS plus a short tail (room echo)."""
-
         self._cancel_echo_suppress_timer()
         delay_s = max(0.0, self.config.tts.echo_suppress_tail_ms / 1000.0)
 
@@ -91,9 +160,12 @@ class Orchestrator:
         self._echo_suppress_timer = timer
         timer.start()
 
+    # -----------------------------------------------------------------------
+    # Main run loop
+    # -----------------------------------------------------------------------
+
     def run(self) -> None:
         """Start worker threads and block in the main event loop."""
-
         self.tts.start()
         self.llm.start()
         self.audio_capture.start()
@@ -116,8 +188,18 @@ class Orchestrator:
             self._shutdown()
 
     def _vad_loop(self) -> None:
-        """Convert raw VAD detections into high-level speech events."""
+        """
+        Convert raw VAD detections into high-level speech events.
 
+        AEC path:
+          In SPEAKING state, speech is always forwarded as INTERRUPT.  The AEC
+          has removed the speaker signal from the mic, so any speech detection
+          is a real barge-in from the user — not speaker bleed.
+
+        Half-duplex path:
+          In SPEAKING state, INTERRUPT requires barge_in_while_speaking = True
+          (safe only with headphones, since there is no speaker signal removal).
+        """
         while not self._shutdown_event.is_set():
             try:
                 frame = self._vad_audio_queue.get(timeout=0.1)
@@ -129,20 +211,19 @@ class Orchestrator:
 
             if current_state == State.IDLE and speech_detected:
                 self.event_queue.put({"type": "SPEECH_DETECTED"})
+
             elif current_state == State.PROCESSING and speech_detected:
-                # User can cancel before TTS starts (no speaker echo yet).
+                # User can cancel before TTS starts (no speaker echo yet)
                 self.event_queue.put({"type": "INTERRUPT"})
-            elif (
-                current_state == State.SPEAKING
-                and speech_detected
-                and self.config.vad.barge_in_while_speaking
-            ):
-                # Optional barge-in during playback (needs headphones without echo).
-                self.event_queue.put({"type": "INTERRUPT"})
+
+            elif current_state == State.SPEAKING and speech_detected:
+                # AEC path: always interrupt (echo is removed from mic signal).
+                # Half-duplex path: only interrupt when barge_in_while_speaking = True.
+                if self.config.aec.enabled or self.config.vad.barge_in_while_speaking:
+                    self.event_queue.put({"type": "INTERRUPT"})
 
     def _event_loop(self) -> None:
         """Consume all worker events and drive the state machine on the main thread."""
-
         while True:
             try:
                 event = self.event_queue.get(timeout=0.5)
@@ -169,8 +250,9 @@ class Orchestrator:
                 self._handle_utterance(text)
 
             elif event_type == "FIRST_TTS_CHUNK":
-                # Half-duplex STT: mute mic to Deepgram while TTS plays (unless barge-in + headphones).
-                if not self.config.vad.barge_in_while_speaking:
+                # Half-duplex: mute mic to STT while TTS plays.
+                # Skipped when AEC is active — AEC handles echo removal directly.
+                if not self.config.aec.enabled and not self.config.vad.barge_in_while_speaking:
                     self._cancel_echo_suppress_timer()
                     self._set_stt_echo_suppression(True)
                 self.state_machine.transition(AppEvent.FIRST_TTS_CHUNK)
@@ -193,7 +275,8 @@ class Orchestrator:
                             self.config.history.max_messages_in_context,
                         )
                     self.vad.reset()
-                    if not self.config.vad.barge_in_while_speaking:
+                    # Schedule echo release only on half-duplex path
+                    if not self.config.aec.enabled and not self.config.vad.barge_in_while_speaking:
                         self._schedule_stt_echo_release()
                     self._display_status("Ready")
 
@@ -205,8 +288,10 @@ class Orchestrator:
                     self.tts.interrupt()
                     self.llm.cancel()
                     self.vad.reset()
-                    self._cancel_echo_suppress_timer()
-                    self._set_stt_echo_suppression(False)
+                    # On half-duplex path, cancel suppress timer and re-open mic
+                    if not self.config.aec.enabled:
+                        self._cancel_echo_suppress_timer()
+                        self._set_stt_echo_suppression(False)
                     self.state_machine.transition(AppEvent.INTERRUPT)
                     self._display_status("Interrupted — listening...")
 
@@ -217,8 +302,9 @@ class Orchestrator:
             elif event_type == "ERROR":
                 logger.error("Error event: %s", event.get("error"))
                 print(f"  Error: {event.get('error')}")
-                self._cancel_echo_suppress_timer()
-                self._set_stt_echo_suppression(False)
+                if not self.config.aec.enabled:
+                    self._cancel_echo_suppress_timer()
+                    self._set_stt_echo_suppression(False)
                 self.state_machine.transition(AppEvent.ERROR)
                 self._display_status("Ready (after error)")
 
@@ -227,7 +313,6 @@ class Orchestrator:
 
     def _handle_utterance(self, text: str) -> None:
         """Persist user input, prepare the prompt, and submit a new LLM request."""
-
         self._messages = append_message(
             self.config.history.file,
             "user",
@@ -250,9 +335,11 @@ class Orchestrator:
 
     def _shutdown(self) -> None:
         """Stop all workers in reverse start order and exit cleanly."""
+        # Release half-duplex STT suppression (no-op on AEC path)
+        if not self.config.aec.enabled:
+            self._cancel_echo_suppress_timer()
+            self._set_stt_echo_suppression(False)
 
-        self._cancel_echo_suppress_timer()
-        self._set_stt_echo_suppression(False)
         self._shutdown_event.set()
         if self._vad_thread is not None:
             self._vad_thread.join(timeout=1)

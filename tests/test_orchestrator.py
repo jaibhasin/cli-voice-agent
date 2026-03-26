@@ -15,6 +15,7 @@ def make_mock_config(tmp_path):
         VADConfig,
     )
 
+    # aec defaults to AECConfig(enabled=False) — half-duplex path
     return AppConfig(
         system_prompt="You are a test assistant.",
         audio=AudioConfig(),
@@ -25,6 +26,33 @@ def make_mock_config(tmp_path):
         history=HistoryConfig(file=str(tmp_path / "history.json")),
         openai_api_key="sk-test",
         deepgram_api_key="dg-test",
+    )
+
+
+def make_mock_config_aec(tmp_path):
+    """Config with aec.enabled = True for testing the AEC code path."""
+    from voice_app.config import (
+        AECConfig,
+        AppConfig,
+        AudioConfig,
+        DeepgramConfig,
+        HistoryConfig,
+        LLMConfig,
+        TTSConfig,
+        VADConfig,
+    )
+
+    return AppConfig(
+        system_prompt="You are a test assistant.",
+        audio=AudioConfig(),
+        vad=VADConfig(),
+        deepgram=DeepgramConfig(),
+        llm=LLMConfig(),
+        tts=TTSConfig(),
+        history=HistoryConfig(file=str(tmp_path / "history.json")),
+        openai_api_key="sk-test",
+        deepgram_api_key="dg-test",
+        aec=AECConfig(enabled=True),
     )
 
 
@@ -46,6 +74,33 @@ def make_orchestrator(tmp_path):
         mock_vad = orch.vad
 
     return orch, mock_tts, mock_llm, mock_vad
+
+
+def make_orchestrator_aec(tmp_path):
+    """
+    Build an Orchestrator with aec.enabled = True, mocking AEC components so the
+    test suite runs without speexdsp installed.
+    """
+    from voice_app.orchestrator import Orchestrator
+
+    cfg = make_mock_config_aec(tmp_path)
+
+    # Patch AECProcessor and SpeakerReferenceBuffer at the module level so the
+    # local `from voice_app.aec import ...` inside Orchestrator.__init__ picks up
+    # the mocks rather than trying to import speexdsp.
+    with (
+        patch("voice_app.aec.AECProcessor"),
+        patch("voice_app.aec.SpeakerReferenceBuffer"),
+        patch("voice_app.orchestrator.AudioCapture"),
+        patch("voice_app.orchestrator.VADDetector"),
+        patch("voice_app.orchestrator.STTClient"),
+        patch("voice_app.orchestrator.LLMClient"),
+        patch("voice_app.orchestrator.TTSEngine"),
+    ):
+        orch = Orchestrator(cfg, debug=False)
+        mock_stt = orch.stt
+
+    return orch, mock_stt
 
 
 def pump_events(orch, *events):
@@ -151,3 +206,43 @@ class TestHistoryPersistence:
             message["role"] == "assistant" and "great" in message["content"]
             for message in messages
         )
+
+
+class TestAECOrchestrator:
+    """
+    Verify the AEC code path in the orchestrator.
+
+    With aec.enabled = True:
+      • FIRST_TTS_CHUNK must NOT call stt.set_echo_suppression — AEC removes
+        the echo upstream so half-duplex muting is unnecessary.
+      • INTERRUPT must NOT call stt.set_echo_suppression — same reason.
+      • TTS_COMPLETE must NOT schedule the echo-release timer.
+    """
+
+    def test_first_tts_chunk_does_not_suppress_stt_with_aec(self, tmp_path):
+        """AEC path: FIRST_TTS_CHUNK skips STT silence injection."""
+        orch, mock_stt = make_orchestrator_aec(tmp_path)
+        orch.state_machine.state = State.PROCESSING
+        pump_events(orch, {"type": "FIRST_TTS_CHUNK"})
+
+        mock_stt.set_echo_suppression.assert_not_called()
+        assert orch.state_machine.state == State.SPEAKING
+
+    def test_interrupt_does_not_suppress_stt_with_aec(self, tmp_path):
+        """AEC path: INTERRUPT does not call STT echo suppression helpers."""
+        orch, mock_stt = make_orchestrator_aec(tmp_path)
+        orch.state_machine.state = State.SPEAKING
+        pump_events(orch, {"type": "INTERRUPT"})
+
+        mock_stt.set_echo_suppression.assert_not_called()
+        assert orch.state_machine.state == State.LISTENING
+
+    def test_tts_complete_does_not_schedule_echo_release_with_aec(self, tmp_path):
+        """AEC path: TTS_COMPLETE leaves echo-suppress timer as None."""
+        orch, _ = make_orchestrator_aec(tmp_path)
+        orch.state_machine.state = State.SPEAKING
+        orch._gen_id = 1
+        pump_events(orch, {"type": "TTS_COMPLETE", "gen_id": 1})
+
+        assert orch._echo_suppress_timer is None
+        assert orch.state_machine.state == State.IDLE

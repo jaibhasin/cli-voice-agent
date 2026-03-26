@@ -1,5 +1,6 @@
 import queue
 import threading
+import time
 
 import pyaudio
 
@@ -9,10 +10,28 @@ class AudioCapture:
 
     FRAME_DURATION_MS = 20
 
-    def __init__(self, sample_rate: int, channels: int) -> None:
+    def __init__(
+        self,
+        sample_rate: int,
+        channels: int,
+        aec_processor=None,
+    ) -> None:
+        """
+        Parameters
+        ----------
+        sample_rate:   Mic sample rate in Hz (16 000 for this pipeline).
+        channels:      Number of channels (1 = mono).
+        aec_processor: Optional AECProcessor instance.  When supplied, each mic
+                       frame is passed through AEC before being forwarded to
+                       consumers (VAD queue and STT queue).  Set to None when
+                       aec.enabled is False (half-duplex path).
+        """
         self.sample_rate = sample_rate
         self.channels = channels
         self.chunk_size = int(sample_rate * self.FRAME_DURATION_MS / 1000)
+
+        # Optional AEC processor injected by the orchestrator when aec.enabled = True.
+        self._aec_processor = aec_processor
 
         self._queues: list[queue.Queue] = []
         self._stop_event = threading.Event()
@@ -56,14 +75,32 @@ class AudioCapture:
         self._pa.terminate()
 
     def _capture_loop(self) -> None:
-        """Read one frame at a time and enqueue it for every consumer."""
+        """
+        Read one frame at a time, optionally apply AEC, and enqueue to consumers.
 
+        AEC path (aec.enabled = True)
+        ------------------------------
+        After reading a raw mic frame we immediately stamp it with
+        time.monotonic_ns() and pass it through AECProcessor.process().
+        The processor looks up the speaker reference frame that was playing at
+        that timestamp (from SpeakerReferenceBuffer) and subtracts it from the
+        mic signal using speexdsp.  The cleaned frame is then enqueued.
+
+        Half-duplex path (aec.enabled = False)
+        ----------------------------------------
+        The frame is enqueued as-is.  The STT client handles silence injection
+        via the echo-suppression flag set by the orchestrator.
+        """
         while not self._stop_event.is_set():
             try:
                 frame = self._stream.read(
                     self.chunk_size,
                     exception_on_overflow=False,
                 )
+                # Apply AEC before distributing to VAD/STT consumers
+                if self._aec_processor is not None:
+                    frame = self._aec_processor.process(frame, time.monotonic_ns())
+
                 for consumer_queue in self._queues:
                     try:
                         consumer_queue.put_nowait(frame)
