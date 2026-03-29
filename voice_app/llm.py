@@ -116,6 +116,13 @@ class LLMClient:
                         if not first_chunk_sent:
                             self.event_queue.put({"type": "FIRST_TTS_CHUNK"})
                             first_chunk_sent = True
+                        self.event_queue.put(
+                            {
+                                "type": "ASSISTANT_RESPONSE_CHUNK",
+                                "gen_id": gen_id,
+                                "text": sentence,
+                            }
+                        )
 
                         self.tts_engine.speak(sentence, gen_id)
                         full_response += sentence + " "
@@ -126,6 +133,13 @@ class LLMClient:
                 if not first_chunk_sent:
                     self.event_queue.put({"type": "FIRST_TTS_CHUNK"})
                     first_chunk_sent = True
+                self.event_queue.put(
+                    {
+                        "type": "ASSISTANT_RESPONSE_CHUNK",
+                        "gen_id": gen_id,
+                        "text": buffer.strip(),
+                    }
+                )
                 self.tts_engine.speak(buffer.strip(), gen_id)
                 full_response += buffer.strip()
 

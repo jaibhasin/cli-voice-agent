@@ -45,6 +45,10 @@ aec:
   speaker_delay_ms: 60
   # Ring-buffer depth for speaker reference frames; 200 ≈ 4 s at 20 ms/frame
   ref_buffer_frames: 200
+  # Extra transcript guard after speech output ends; catches residual leakage
+  # that survives AEC or remains in the OS/hardware output buffers.
+  residual_echo_guard_ms: 2000
+  interrupted_echo_guard_ms: 600
 
 # Text-to-speech — local piper-tts subprocess + PyAudio output pipeline
 tts:
