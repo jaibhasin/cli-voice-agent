@@ -32,13 +32,15 @@ def test_load_config_reads_yaml_and_env(tmp_path):
             tts:
               rate: 175
               volume: 0.9
-              service: "deepgram"
-              voice: "aura-2-thalia-en"
+              model_path: "models/test.onnx"
+              piper_bin: "piper"
             aec:
               enabled: true
               filter_length: 2048
               speaker_delay_ms: 0
               ref_buffer_frames: 200
+              residual_echo_guard_ms: 2000
+              interrupted_echo_guard_ms: 600
             history:
               file: "conv.json"
               max_messages_in_context: 50
@@ -65,14 +67,16 @@ def test_load_config_reads_yaml_and_env(tmp_path):
     assert cfg.deepgram.model == "nova-3"
     assert cfg.llm.model == "gpt-4o-mini"
     assert cfg.tts.rate == 175
-    assert cfg.tts.service == "deepgram"
-    assert cfg.tts.voice == "aura-2-thalia-en"
+    assert cfg.tts.model_path == "models/test.onnx"
+    assert cfg.tts.piper_bin == "piper"
     assert cfg.history.file == "conv.json"
     # AECConfig fields
     assert cfg.aec.enabled is True
     assert cfg.aec.filter_length == 2048
     assert cfg.aec.speaker_delay_ms == 0
     assert cfg.aec.ref_buffer_frames == 200
+    assert cfg.aec.residual_echo_guard_ms == 2000
+    assert cfg.aec.interrupted_echo_guard_ms == 600
 
 
 def test_load_config_aec_defaults_when_section_absent(tmp_path):

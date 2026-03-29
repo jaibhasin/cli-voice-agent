@@ -72,10 +72,16 @@ def test_stream_response_emits_sentence_chunks_and_completion():
 
     assert fake_tts.spoken == [("Hello there.", 1), ("How are you?", 1)]
     assert fake_tts.finished == [1]
-    events = [event_queue.get_nowait(), event_queue.get_nowait()]
+    events = []
+    while not event_queue.empty():
+        events.append(event_queue.get_nowait())
+
     assert events[0]["type"] == "FIRST_TTS_CHUNK"
-    assert events[1]["type"] == "LLM_RESPONSE_READY"
-    assert events[1]["response"] == "Hello there. How are you?"
+    chunk_events = [event for event in events if event["type"] == "ASSISTANT_RESPONSE_CHUNK"]
+    assert [event["text"] for event in chunk_events] == ["Hello there.", "How are you?"]
+
+    completion_event = next(event for event in events if event["type"] == "LLM_RESPONSE_READY")
+    assert completion_event["response"] == "Hello there. How are you?"
 
 
 def test_cancel_invalidates_generation_and_drains_pending_submissions():

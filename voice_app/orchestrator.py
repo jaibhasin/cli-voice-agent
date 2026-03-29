@@ -9,9 +9,10 @@ When config.aec.enabled is True:
     TTSEngine (speaker reference tap) and AudioCapture (mic cleanup).
   • STT receives echo-free audio → set_echo_suppression / silence injection
     are disabled.
-  • The VAD loop emits INTERRUPT whenever speech is detected in SPEAKING state
-    (no barge_in_while_speaking gate — AEC prevents false positives from the
-    speaker signal reaching the mic).
+  • Residual echo is filtered with a transcript-aware guard:
+    – VAD hits during SPEAKING are treated as provisional only.
+    – STT interim/final text that matches the assistant's own response is dropped.
+    – Non-echo STT text still triggers barge-in and normal listening.
   • All _echo_suppress_timer / _set_stt_echo_suppression / _schedule_stt_echo_release
     call sites are skipped.
 
@@ -28,6 +29,7 @@ import threading
 
 from voice_app.audio_capture import AudioCapture
 from voice_app.config import AppConfig
+from voice_app.echo_guard import EchoTranscriptGuard
 from voice_app.history import append_message, load_history
 from voice_app.llm import LLMClient
 from voice_app.state_machine import AppEvent, State, StateMachine
@@ -50,6 +52,10 @@ class Orchestrator:
         self._shutdown_event = threading.Event()
         self._vad_thread: threading.Thread | None = None
         self._pending_response_by_gen: dict[int, str] = {}
+        self._echo_guard = EchoTranscriptGuard(
+            cooldown_ms=config.aec.residual_echo_guard_ms,
+            interrupted_cooldown_ms=config.aec.interrupted_echo_guard_ms,
+        )
 
         self._vad_audio_queue: queue.Queue = queue.Queue(maxsize=200)
         # Larger buffer for STT so brief backpressure does not drop audio before Deepgram.
@@ -192,9 +198,9 @@ class Orchestrator:
         Convert raw VAD detections into high-level speech events.
 
         AEC path:
-          In SPEAKING state, speech is always forwarded as INTERRUPT.  The AEC
-          has removed the speaker signal from the mic, so any speech detection
-          is a real barge-in from the user — not speaker bleed.
+          In SPEAKING state, raw VAD hits are treated as provisional only.
+          Residual speaker leakage can still trip the detector, so barge-in is
+          confirmed by a non-echo transcript on the main thread.
 
         Half-duplex path:
           In SPEAKING state, INTERRUPT requires barge_in_while_speaking = True
@@ -210,6 +216,8 @@ class Orchestrator:
             current_state = self.state_machine.state
 
             if current_state == State.IDLE and speech_detected:
+                if self.config.aec.enabled and self._echo_guard.should_gate_vad():
+                    continue
                 self.event_queue.put({"type": "SPEECH_DETECTED"})
 
             elif current_state == State.PROCESSING and speech_detected:
@@ -217,9 +225,9 @@ class Orchestrator:
                 self.event_queue.put({"type": "INTERRUPT"})
 
             elif current_state == State.SPEAKING and speech_detected:
-                # AEC path: always interrupt (echo is removed from mic signal).
-                # Half-duplex path: only interrupt when barge_in_while_speaking = True.
-                if self.config.aec.enabled or self.config.vad.barge_in_while_speaking:
+                # With AEC enabled, wait for transcript evidence before barge-in.
+                # Half-duplex still uses the explicit barge-in flag.
+                if not self.config.aec.enabled and self.config.vad.barge_in_while_speaking:
                     self.event_queue.put({"type": "INTERRUPT"})
 
     def _event_loop(self) -> None:
@@ -237,14 +245,33 @@ class Orchestrator:
                 self.state_machine.transition(AppEvent.SPEECH_DETECTED)
                 self._display_status("Listening...")
 
+            elif event_type == "ASSISTANT_RESPONSE_CHUNK":
+                if event.get("gen_id") == self._gen_id:
+                    self._echo_guard.note_tts_chunk(
+                        gen_id=self._gen_id,
+                        text=event.get("text", ""),
+                    )
+
             elif event_type == "UTTERANCE_COMPLETE":
+                text = event["text"]
+                if self._is_probable_echo(text):
+                    self._discard_echo_listening_state()
+                    logger.info("Ignoring probable echo utterance: %s", text)
+                    continue
+
+                if self.state_machine.state == State.SPEAKING and self.config.aec.enabled:
+                    self._interrupt_current_turn()
+
+                if self.state_machine.state == State.IDLE:
+                    self.state_machine.transition(AppEvent.SPEECH_DETECTED)
+                    self._display_status("Listening...")
+
                 if self.state_machine.state != State.LISTENING:
                     logger.debug(
                         "Ignoring UTTERANCE_COMPLETE (state=%s)",
                         self.state_machine.state,
                     )
                     continue
-                text = event["text"]
                 self.state_machine.transition(AppEvent.UTTERANCE_COMPLETE)
                 self._display_user(text)
                 self._handle_utterance(text)
@@ -261,10 +288,13 @@ class Orchestrator:
 
             elif event_type == "LLM_RESPONSE_READY":
                 if event.get("gen_id") == self._gen_id:
-                    self._pending_response_by_gen[self._gen_id] = event.get("response", "")
+                    response_text = event.get("response", "")
+                    self._pending_response_by_gen[self._gen_id] = response_text
+                    self._echo_guard.note_response_ready(self._gen_id, response_text)
 
             elif event_type == "TTS_COMPLETE":
                 if event.get("gen_id") == self._gen_id:
+                    self._echo_guard.note_tts_complete(self._gen_id)
                     self.state_machine.transition(AppEvent.TTS_COMPLETE)
                     response_text = self._pending_response_by_gen.pop(self._gen_id, "")
                     if response_text:
@@ -281,23 +311,22 @@ class Orchestrator:
                     self._display_status("Ready")
 
             elif event_type == "INTERRUPT":
-                if self.state_machine.state in (State.SPEAKING, State.PROCESSING):
-                    interrupted_gen = self._gen_id
-                    self._gen_id += 1
-                    self._pending_response_by_gen.pop(interrupted_gen, None)
-                    self.tts.interrupt()
-                    self.llm.cancel()
-                    self.vad.reset()
-                    # On half-duplex path, cancel suppress timer and re-open mic
-                    if not self.config.aec.enabled:
-                        self._cancel_echo_suppress_timer()
-                        self._set_stt_echo_suppression(False)
-                    self.state_machine.transition(AppEvent.INTERRUPT)
-                    self._display_status("Interrupted — listening...")
+                self._interrupt_current_turn()
 
             elif event_type == "TRANSCRIPT_INTERIM":
+                text = event.get("text", "")
+                if self._is_probable_echo(text):
+                    logger.debug("Ignoring probable echo interim transcript: %s", text)
+                    continue
+
+                if self.state_machine.state == State.SPEAKING and self.config.aec.enabled:
+                    self._interrupt_current_turn()
+                elif self.state_machine.state == State.IDLE:
+                    self.state_machine.transition(AppEvent.SPEECH_DETECTED)
+                    self._display_status("Listening...")
+
                 if self.debug:
-                    logger.debug("[STT partial] %s", event.get("text", ""))
+                    logger.debug("[STT partial] %s", text)
 
             elif event_type == "ERROR":
                 logger.error("Error event: %s", event.get("error"))
@@ -321,11 +350,44 @@ class Orchestrator:
         )
 
         self._gen_id += 1
+        self._echo_guard.start_generation(self._gen_id)
         self.tts.set_generation(self._gen_id)
 
         messages = [{"role": "system", "content": self.config.system_prompt}]
         messages.extend(self._messages[-self.config.history.max_messages_in_context :])
         self.llm.submit(messages, self._gen_id)
+
+    def _interrupt_current_turn(self) -> None:
+        if self.state_machine.state not in (State.SPEAKING, State.PROCESSING):
+            return
+
+        interrupted_gen = self._gen_id
+        self._gen_id += 1
+        self._pending_response_by_gen.pop(interrupted_gen, None)
+        self._echo_guard.note_interrupt(interrupted_gen)
+        self.tts.interrupt()
+        self.llm.cancel()
+        self.vad.reset()
+        if not self.config.aec.enabled:
+            self._cancel_echo_suppress_timer()
+            self._set_stt_echo_suppression(False)
+        self.state_machine.transition(AppEvent.INTERRUPT)
+        self._display_status("Interrupted — listening...")
+
+    def _is_probable_echo(self, text: str) -> bool:
+        if not self.config.aec.enabled:
+            return False
+
+        return self._echo_guard.is_probable_echo(
+            text,
+            speaking_active=self.state_machine.state == State.SPEAKING,
+        )
+
+    def _discard_echo_listening_state(self) -> None:
+        if self.state_machine.state == State.LISTENING:
+            self.state_machine.state = State.IDLE
+            self.vad.reset()
+            self._display_status("Ready")
 
     def _display_status(self, status: str) -> None:
         print(f"  [{status}]")
@@ -347,4 +409,5 @@ class Orchestrator:
         self.audio_capture.stop()
         self.llm.stop()
         self.tts.stop()
+        self._echo_guard.clear()
         print("\nGoodbye!")

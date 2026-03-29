@@ -74,6 +74,12 @@ class AECConfig:
     filter_length: int = 2048
     speaker_delay_ms: int = 0
     ref_buffer_frames: int = 200
+    # Keep guarding transcripts for a short period after TTS completes because
+    # buffered speaker audio can still be leaving the hardware output path.
+    residual_echo_guard_ms: int = 2000
+    # After an interrupt we drain our own queues immediately, so a shorter tail
+    # is enough to ignore the last frames still in the OS audio buffer.
+    interrupted_echo_guard_ms: int = 600
 
 
 @dataclass

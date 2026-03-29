@@ -99,8 +99,11 @@ def make_orchestrator_aec(tmp_path):
     ):
         orch = Orchestrator(cfg, debug=False)
         mock_stt = orch.stt
+        mock_tts = orch.tts
+        mock_llm = orch.llm
+        mock_vad = orch.vad
 
-    return orch, mock_stt
+    return orch, mock_stt, mock_tts, mock_llm, mock_vad
 
 
 def pump_events(orch, *events):
@@ -221,7 +224,7 @@ class TestAECOrchestrator:
 
     def test_first_tts_chunk_does_not_suppress_stt_with_aec(self, tmp_path):
         """AEC path: FIRST_TTS_CHUNK skips STT silence injection."""
-        orch, mock_stt = make_orchestrator_aec(tmp_path)
+        orch, mock_stt, _, _, _ = make_orchestrator_aec(tmp_path)
         orch.state_machine.state = State.PROCESSING
         pump_events(orch, {"type": "FIRST_TTS_CHUNK"})
 
@@ -230,7 +233,7 @@ class TestAECOrchestrator:
 
     def test_interrupt_does_not_suppress_stt_with_aec(self, tmp_path):
         """AEC path: INTERRUPT does not call STT echo suppression helpers."""
-        orch, mock_stt = make_orchestrator_aec(tmp_path)
+        orch, mock_stt, _, _, _ = make_orchestrator_aec(tmp_path)
         orch.state_machine.state = State.SPEAKING
         pump_events(orch, {"type": "INTERRUPT"})
 
@@ -239,10 +242,57 @@ class TestAECOrchestrator:
 
     def test_tts_complete_does_not_schedule_echo_release_with_aec(self, tmp_path):
         """AEC path: TTS_COMPLETE leaves echo-suppress timer as None."""
-        orch, _ = make_orchestrator_aec(tmp_path)
+        orch, _, _, _, _ = make_orchestrator_aec(tmp_path)
         orch.state_machine.state = State.SPEAKING
         orch._gen_id = 1
         pump_events(orch, {"type": "TTS_COMPLETE", "gen_id": 1})
 
         assert orch._echo_suppress_timer is None
+        assert orch.state_machine.state == State.IDLE
+
+    def test_echo_interim_does_not_interrupt_with_aec(self, tmp_path):
+        orch, _, mock_tts, mock_llm, _ = make_orchestrator_aec(tmp_path)
+        orch._gen_id = 1
+        orch.state_machine.state = State.SPEAKING
+
+        pump_events(
+            orch,
+            {"type": "ASSISTANT_RESPONSE_CHUNK", "gen_id": 1, "text": "Let me explain the plan."},
+            {"type": "TRANSCRIPT_INTERIM", "text": "explain the plan"},
+        )
+
+        mock_tts.interrupt.assert_not_called()
+        mock_llm.cancel.assert_not_called()
+        assert orch.state_machine.state == State.SPEAKING
+
+    def test_non_echo_interim_interrupts_with_aec(self, tmp_path):
+        orch, _, mock_tts, mock_llm, mock_vad = make_orchestrator_aec(tmp_path)
+        orch._gen_id = 1
+        orch.state_machine.state = State.SPEAKING
+
+        pump_events(
+            orch,
+            {"type": "ASSISTANT_RESPONSE_CHUNK", "gen_id": 1, "text": "Let me explain the plan."},
+            {"type": "TRANSCRIPT_INTERIM", "text": "stop and listen"},
+        )
+
+        mock_tts.interrupt.assert_called_once()
+        mock_llm.cancel.assert_called_once()
+        mock_vad.reset.assert_called_once()
+        assert orch.state_machine.state == State.LISTENING
+
+    def test_echo_utterance_after_tts_complete_is_ignored(self, tmp_path):
+        orch, _, _, mock_llm, _ = make_orchestrator_aec(tmp_path)
+        orch._gen_id = 1
+        orch.state_machine.state = State.SPEAKING
+        orch._pending_response_by_gen[1] = "Let me explain the plan."
+
+        pump_events(
+            orch,
+            {"type": "ASSISTANT_RESPONSE_CHUNK", "gen_id": 1, "text": "Let me explain the plan."},
+            {"type": "TTS_COMPLETE", "gen_id": 1},
+            {"type": "UTTERANCE_COMPLETE", "text": "explain the plan"},
+        )
+
+        mock_llm.submit.assert_not_called()
         assert orch.state_machine.state == State.IDLE
