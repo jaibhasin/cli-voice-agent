@@ -65,6 +65,58 @@ class TestSpeakerReferenceBuffer:
         assert result == frame_b
 
     # -----------------------------------------------------------------------
+    # speaker_delay_ms — timestamp shift
+    # -----------------------------------------------------------------------
+
+    def test_get_frame_at_zero_delay_returns_closest_frame(self):
+        """
+        With speaker_delay_ms=0 the lookup is unchanged: the closest frame by
+        raw timestamp is returned (identical to pre-delay-fix behaviour).
+        """
+        buf = self._make_buf()
+        base_ns = time.monotonic_ns()
+        frame_a = b"\xAA" * FRAME_BYTES
+        frame_b = b"\xBB" * FRAME_BYTES
+        # frame_a at t=0, frame_b at t=40 ms
+        buf.push(base_ns, frame_a)
+        buf.push(base_ns + 40_000_000, frame_b)
+
+        # Query at t=30 ms with no delay → closer to frame_b
+        result = buf.get_frame_at(base_ns + 30_000_000, speaker_delay_ms=0)
+        assert result == frame_b
+
+    def test_get_frame_at_nonzero_delay_shifts_lookup_back(self):
+        """
+        With speaker_delay_ms=60 a query at t=100 ms is shifted to t=40 ms,
+        causing the buffer to return the frame closest to t=40 ms instead.
+
+        This simulates the scenario where the PyAudio callback queued frame_a
+        at t=40 ms but the microphone only captures it at t=100 ms because of
+        hardware + acoustic propagation delay.  Without the shift, a naïve
+        lookup at t=100 ms would find a different frame; with it, we correctly
+        retrieve frame_a.
+        """
+        buf = self._make_buf()
+        base_ns = time.monotonic_ns()
+        frame_early = b"\xAA" * FRAME_BYTES  # queued at base_ns + 40 ms
+        frame_late  = b"\xBB" * FRAME_BYTES  # queued at base_ns + 100 ms
+
+        buf.push(base_ns + 40_000_000,  frame_early)
+        buf.push(base_ns + 100_000_000, frame_late)
+
+        # Without delay: query at t+100 ms → frame_late (exact match)
+        assert buf.get_frame_at(base_ns + 100_000_000, speaker_delay_ms=0) == frame_late
+
+        # With 60 ms delay: adjusted query = t+100 ms − 60 ms = t+40 ms → frame_early
+        assert buf.get_frame_at(base_ns + 100_000_000, speaker_delay_ms=60) == frame_early
+
+    def test_get_frame_at_empty_buffer_returns_silence_with_delay(self):
+        """get_frame_at() on an empty buffer returns silence even with a nonzero delay."""
+        buf = self._make_buf()
+        result = buf.get_frame_at(time.monotonic_ns(), speaker_delay_ms=60)
+        assert result == self._silence()
+
+    # -----------------------------------------------------------------------
     # Stale frame handling
     # -----------------------------------------------------------------------
 
@@ -224,6 +276,47 @@ class TestAECProcessor:
 
         mock_speexdsp.EchoCanceller.create.assert_called_once_with(
             FRAME_SIZE, 1024, 16_000
+        )
+
+    def test_process_passes_speaker_delay_to_get_frame_at(self):
+        """
+        AECProcessor.process() must forward config.speaker_delay_ms to
+        SpeakerReferenceBuffer.get_frame_at() so the timestamp lookup is
+        time-shifted by the known hardware + acoustic delay.
+
+        We verify this by placing two frames in the buffer at t+0 ms and
+        t+100 ms, then calling process() with a mic timestamp of t+100 ms and
+        a configured delay of 60 ms.  The adjusted query lands at t+40 ms,
+        which is closer to frame_early (t+0 ms) than to frame_late (t+100 ms),
+        so ec.process() should receive frame_early as its reference argument.
+        """
+        mock_speexdsp, mock_ec = self._make_mock_speexdsp()
+
+        with patch.dict("sys.modules", {"speexdsp": mock_speexdsp}):
+            from voice_app.aec import AECProcessor
+            from voice_app.config import AECConfig
+
+            ref_buf = SpeakerReferenceBuffer(maxlen=10, frame_size=FRAME_SIZE)
+            base_ns = time.monotonic_ns()
+
+            frame_early = b"\xAA" * FRAME_BYTES  # queued at base_ns (t=0)
+            frame_late  = b"\xBB" * FRAME_BYTES  # queued at base_ns + 100 ms
+            ref_buf.push(base_ns,               frame_early)
+            ref_buf.push(base_ns + 100_000_000, frame_late)
+
+            # Configure a 60 ms speaker delay
+            cfg = AECConfig(enabled=True, filter_length=2048, speaker_delay_ms=60)
+            proc = AECProcessor(cfg, ref_buffer=ref_buf)
+
+            mic_frame = b"\xCC" * FRAME_BYTES
+            # Mic timestamp at base_ns + 100 ms; with 60 ms shift → t+40 ms
+            # → closest reference is frame_early
+            proc.process(mic_frame, base_ns + 100_000_000)
+
+        _, ref_arg = mock_ec.process.call_args[0]
+        assert ref_arg == frame_early, (
+            "Expected frame_early (t+0 ms) as reference after 60 ms delay shift, "
+            f"got {'frame_late' if ref_arg == frame_late else repr(ref_arg)}"
         )
 
     # -----------------------------------------------------------------------

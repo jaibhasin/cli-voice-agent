@@ -79,9 +79,8 @@ class AECConfig:
 @dataclass
 class TTSConfig:
     """
-    Speech synthesis settings.
+    Speech synthesis settings (local piper-tts).
 
-    service / voice apply to the Deepgram TTS WebSocket path.
     echo_suppress_tail_ms is only used when aec.enabled is False (half-duplex fallback).
     """
 
@@ -90,9 +89,11 @@ class TTSConfig:
     # After TTS ends, keep mic audio from reaching STT this many ms longer (room echo).
     # Only relevant when aec.enabled = false.
     echo_suppress_tail_ms: int = 350
-    # Deepgram TTS WebSocket model.  See deepgram.com/docs for available voices.
-    service: str = "deepgram"
-    voice: str = "aura-2-thalia-en"
+    # Absolute or relative path to the piper .onnx voice model.
+    # Falls back to the PIPER_MODEL environment variable.
+    model_path: str = ""
+    # Name or path of the piper executable.
+    piper_bin: str = "piper"
 
 
 @dataclass

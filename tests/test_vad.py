@@ -1,9 +1,22 @@
+"""
+tests/test_vad.py — VADDetector tests for the silero-vad backend.
+
+The internal ``vad.vad`` attribute is a ``_SileroWrapper`` instance that
+exposes the same ``is_speech(frame, rate) -> bool`` interface as webrtcvad,
+so patching ``vad.vad.is_speech`` still works exactly as before.
+
+One silero-vad chunk = 512 int16 samples = 1024 bytes @ 16 kHz.
+We size SILENT_FRAME / VOICED_FRAME to exactly one chunk so each
+``process_frame`` call produces exactly one ring-buffer update.
+"""
+
 from unittest.mock import patch
 
 from voice_app.vad import VADDetector
 
-SILENT_FRAME = b"\x00" * 640
-VOICED_FRAME = b"\x01" * 640
+# 512 int16 samples = 1024 bytes — exactly one Silero VAD chunk at 16 kHz.
+SILENT_FRAME = b"\x00" * 1024
+VOICED_FRAME = b"\x01" * 1024
 
 
 def make_vad(speech_start_frames=6, ring_buffer_size=8):
