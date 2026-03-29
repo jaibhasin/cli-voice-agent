@@ -41,15 +41,16 @@ aec:
   enabled: true
   # speexdsp echo tail in samples; 2048 = 128 ms at 16 kHz (covers most rooms)
   filter_length: 2048
-  # 0 = let speexdsp adapt to the playback buffer delay automatically
-  speaker_delay_ms: 0
+  # Typical macOS hardware/buffer latency (60ms) helps speexdsp align the frames
+  speaker_delay_ms: 60
   # Ring-buffer depth for speaker reference frames; 200 ≈ 4 s at 20 ms/frame
   ref_buffer_frames: 200
 
-# Text-to-speech — Deepgram TTS WebSocket + PyAudio output pipeline
+# Text-to-speech — local piper-tts subprocess + PyAudio output pipeline
 tts:
-  service: "deepgram"
-  voice: "aura-2-thalia-en"
+  # Path to the piper .onnx voice model (also settable via PIPER_MODEL env var)
+  model_path: "models/en_US-lessac-medium.onnx"
+  piper_bin: "piper"
   rate: 175
   volume: 0.9
   # Kept for the aec.enabled=false half-duplex fallback:

@@ -171,6 +171,55 @@ speexdsp is adaptive — it learns the room's acoustic delay within ~1 second of
 
 ---
 
+## Post-Implementation Fix: Speaker Reference Timing Alignment (2026-03-26)
+
+### Problem
+
+After the AEC pipeline was wired up, the agent was still self-interrupting: VAD detected speech while the agent was speaking, causing it to interrupt itself mid-sentence.
+
+**Root cause**: The AEC was receiving a misaligned reference signal. The PyAudio output callback fires when a frame is *queued to the hardware buffer*, not when it physically exits the speaker. By the time the mic captures that frame, 40–80 ms of hardware + acoustic propagation delay has elapsed. So `get_frame_at(mic_time_ns)` was finding the reference frame queued at `mic_time_ns`, not the one *physically playing* at `mic_time_ns` — speexdsp was cancelling the wrong echo frame and passing the speaker bleed through to VAD unchecked.
+
+### Fix
+
+**`voice_app/aec.py`** — `SpeakerReferenceBuffer.get_frame_at()`:
+- Added `speaker_delay_ms: int = 0` parameter (default = no change).
+- Before the buffer scan: `adjusted_ns = query_ns - speaker_delay_ms * 1_000_000`.
+- Buffer searches against `adjusted_ns` instead of `query_ns`, finding the frame queued at the moment it was *actually playing* in the mic.
+
+**`voice_app/aec.py`** — `AECProcessor.__init__()`:
+- Reads `config.speaker_delay_ms` and stores as `self._speaker_delay_ms`.
+
+**`voice_app/aec.py`** — `AECProcessor.process()`:
+- Forwards `self._speaker_delay_ms` to `get_frame_at()`.
+- Added explicit comment confirming `ec.process(mic_frame, ref)` argument order (silent wrong-output if reversed).
+
+**`calibrate_aec.py`** (new, project root):
+- Standalone script: plays one click frame via PyAudio output, reads mic frames until peak > 8000, computes and prints `delay_ms = (mic_time_ns - ref_time_ns) / 1_000_000`, and outputs the exact YAML line to paste into `config.yaml`.
+- Timeout: 3 seconds with actionable guidance if no click detected.
+- No new dependencies (`pyaudio` + `numpy` already in `requirements.txt`).
+
+**`config.yaml`** — `aec.speaker_delay_ms: 0` already present (default keeps existing behaviour unchanged for users who skip calibration).
+
+**`tests/test_aec.py`** — 4 new tests added (15 total, all pass):
+- `test_get_frame_at_zero_delay_returns_closest_frame` — zero delay = original behaviour
+- `test_get_frame_at_nonzero_delay_shifts_lookup_back` — 60 ms shift returns earlier frame
+- `test_get_frame_at_empty_buffer_returns_silence_with_delay` — empty + delay = silence
+- `test_process_passes_speaker_delay_to_get_frame_at` — end-to-end: AECProcessor reads config delay and correct reference reaches `ec.process()`
+
+### Calibration Workflow
+
+```bash
+python calibrate_aec.py
+# → Speaker delay detected: 62.3ms
+# → Add this to config.yaml under aec.speaker_delay_ms:
+#     aec:
+#       speaker_delay_ms: 62
+```
+
+Paste the printed value into `config.yaml`. Typical macOS values: 40–80 ms. With this value set, speexdsp receives time-aligned (mic, reference) pairs and converges immediately rather than adapting over the first ~1 s of each turn.
+
+---
+
 ## Sources Consulted
 
 - [Deepgram Voice Agent Echo Cancellation](https://developers.deepgram.com/docs/voice-agent-echo-cancellation)

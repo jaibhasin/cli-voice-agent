@@ -97,14 +97,14 @@ class Orchestrator:
         )
 
         # ------------------------------------------------------------------
-        # TTS — now uses Deepgram WS + PyAudio; receives ref_buffer for AEC
+        # TTS — uses local piper-tts subprocess; receives ref_buffer for AEC
         # ------------------------------------------------------------------
         self.tts = TTSEngine(
             rate=config.tts.rate,
             volume=config.tts.volume,
             event_queue=self.event_queue,
-            api_key=config.deepgram_api_key,
-            voice=config.tts.voice,
+            model_path=config.tts.model_path,
+            piper_bin=config.tts.piper_bin,
             ref_buffer=_ref_buffer,
         )
 

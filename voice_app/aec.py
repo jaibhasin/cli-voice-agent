@@ -37,9 +37,10 @@ import threading
 FRAME_SIZE = 320        # samples per 20 ms frame at 16 kHz
 FRAME_BYTES = FRAME_SIZE * 2  # linear16 mono: 2 bytes/sample
 
-# A reference frame is considered stale if it is more than 2 frame durations
-# (≈ 40 ms) away from the mic timestamp.  Beyond that, return silence.
-_MAX_REF_AGE_NS = int(2 * FRAME_SIZE / 16_000 * 1_000_000_000)  # ~40 000 000 ns
+# A reference frame is considered stale if it is more than 6 frame durations
+# (≈ 120 ms) away from the mic timestamp. This easily covers typical OS/hardware
+# buffer latency (40-80ms on macOS) so we don't accidentally drop valid reference frames.
+_MAX_REF_AGE_NS = int(6 * FRAME_SIZE / 16_000 * 1_000_000_000)  # ~120 000 000 ns
 
 
 class SpeakerReferenceBuffer:
@@ -90,23 +91,49 @@ class SpeakerReferenceBuffer:
     # Consumer API
     # ------------------------------------------------------------------
 
-    def get_frame_at(self, query_ns: int) -> bytes:
+    def get_frame_at(self, query_ns: int, speaker_delay_ms: int = 0) -> bytes:
         """
         Return the buffered frame whose timestamp is closest to query_ns.
 
+        speaker_delay_ms
+        ----------------
+        The PyAudio output callback fires when a frame is *queued* to the
+        hardware buffer, not when it physically exits the speaker.  By the time
+        the microphone captures that frame the hardware + acoustic propagation
+        delay has elapsed — typically 40–80 ms on macOS.
+
+        To compensate, we subtract speaker_delay_ms from query_ns before
+        searching the buffer.  This shifts the lookup *back in time* so we
+        match the reference frame that was queued at the moment corresponding
+        to the mic capture time, rather than the frame queued speaker_delay_ms
+        *after* that moment.
+
+        Example:
+            Mic captures at t=100 ms, speaker delay = 60 ms.
+            Adjusted query = 100 ms − 60 ms = 40 ms → finds the reference
+            frame queued at ~40 ms, which is the one actually playing at 100 ms.
+
+        With speaker_delay_ms = 0 (default) the behaviour is unchanged from the
+        original implementation.
+
         Returns the silence constant when:
           • the buffer is empty (nothing has been played yet), or
-          • the closest frame is more than _MAX_REF_AGE_NS from query_ns
-            (stale after an interrupt, a startup gap, or a silent turn).
+          • the closest frame is more than _MAX_REF_AGE_NS from the adjusted
+            query_ns (stale after an interrupt, a startup gap, or a silent turn).
 
         O(n) scan over the ring buffer (n ≤ 200); acceptable for 20 ms frames.
         """
+        # Convert the millisecond delay to nanoseconds and shift the query
+        # back in time so we find the reference frame that was *physically*
+        # playing when the mic captured its frame.
+        adjusted_ns = query_ns - speaker_delay_ms * 1_000_000
+
         with self._lock:
             if not self._buf:
                 return self._silence
-            # Find the frame with the minimum time distance to the query
-            best_ts, best_frame = min(self._buf, key=lambda x: abs(x[0] - query_ns))
-            if abs(best_ts - query_ns) > _MAX_REF_AGE_NS:
+            # Find the frame with the minimum time distance to the adjusted query
+            best_ts, best_frame = min(self._buf, key=lambda x: abs(x[0] - adjusted_ns))
+            if abs(best_ts - adjusted_ns) > _MAX_REF_AGE_NS:
                 return self._silence
             return best_frame
 
@@ -159,7 +186,8 @@ class AECProcessor:
         """
         Parameters
         ----------
-        config:      AECConfig — only config.filter_length is read here.
+        config:      AECConfig — reads config.filter_length and
+                     config.speaker_delay_ms.
         sample_rate: Audio sample rate in Hz (must be 16 000 for this pipeline).
         frame_size:  Samples per frame (must be 320 for this pipeline).
         ref_buffer:  Shared SpeakerReferenceBuffer populated by TTSEngine.
@@ -177,6 +205,10 @@ class AECProcessor:
             ) from exc
 
         self._ref_buffer = ref_buffer
+        # speaker_delay_ms: hardware + acoustic propagation delay between the
+        # PyAudio callback timestamp and when the sound reaches the microphone.
+        # Calibrate with calibrate_aec.py; 0 = let speexdsp adapt on its own.
+        self._speaker_delay_ms: int = getattr(config, "speaker_delay_ms", 0)
         # Silence used when no reference buffer is wired (defensive fallback)
         self._silence = bytes(frame_size * 2)
         # EchoCanceller.create(frame_size_samples, filter_length_samples, sample_rate)
@@ -198,10 +230,28 @@ class AECProcessor:
         Returns
         -------
         Echo-cancelled frame of the same byte length.
+
+        Timing note
+        -----------
+        speaker_delay_ms is forwarded to get_frame_at() so the buffer lookup
+        shifts the query back in time by the known hardware + acoustic delay.
+        This ensures speexdsp receives the reference frame that was *physically
+        playing* at mic_time_ns rather than the one queued at that moment.
+        With speaker_delay_ms = 0 (default) there is no shift; speexdsp still
+        adapts, just more slowly during the first ~1 s of overlap.
         """
         ref = (
-            self._ref_buffer.get_frame_at(mic_time_ns)
+            # Pass speaker_delay_ms so the lookup compensates for the gap
+            # between when PyAudio queues a frame and when it reaches the mic.
+            self._ref_buffer.get_frame_at(mic_time_ns, self._speaker_delay_ms)
             if self._ref_buffer is not None
             else self._silence
         )
+        # speexdsp.EchoCanceller.process(mic, reference):
+        #   mic       — raw microphone frame (contains speech + echo)
+        #   reference — what the speaker was playing (the echo source)
+        # Returns the echo-cancelled mic signal.
+        # IMPORTANT: argument order is (mic, ref) — NOT (ref, mic).
+        # Reversing them would feed the reference as speech and produce silent
+        # or corrupt output with no error from speexdsp.
         return self._ec.process(mic_frame, ref)

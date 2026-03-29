@@ -8,3 +8,7 @@ dist/
 build/
 .venv/
 venv/
+
+# Local TTS Models
+models/
+*.onnx
